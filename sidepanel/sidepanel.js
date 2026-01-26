@@ -7,6 +7,7 @@
 // ============ STATE ============
 const state = {
     isConnected: false,
+    isProcessingTrade: false, // Lock to prevent concurrent trades
     currentPrice: 0,
     previousPrice: 0,
     candles: [],
@@ -17,8 +18,10 @@ const state = {
         entryPrice: 0,
         pnl: 0,
         highestPnl: 0, // For trailing SL
+
         lowestPnl: 0   // For tracking
     },
+    realPositions: 0, // Real positions from website
     botEnabled: false,
     botStats: {
         trades: 0,
@@ -31,11 +34,93 @@ const state = {
     priceHistory: [],
     // Trailing SL config
     trailingConfig: {
-        trailAmount: 0.5, // Exit if price drops this much from peak
-        minProfit: 0.3,   // Minimum profit before trailing kicks in
-        maxLoss: 1.5      // Maximum allowed loss (hard SL)
-    }
+        trailAmount: 0.1, // Super tight trail
+        minProfit: 0.1,   // Start trailing immediately
+        maxLoss: 0.2      // Very tight hard stop
+    },
+    // Optimization: separate logic loop from UI loop
+    lastChartUpdate: 0,
+    // Strategy Config (Sync with strategy.js if needed, or just use defaults)
+    emaPeriod: 10
 };
+
+// ... (existing code) ...
+
+// ============ STRATEGY LOGIC ============
+function checkStrategy() {
+    // Allow trading with fewer candles for faster start
+    if (!state.botEnabled) return;
+    if (state.isProcessingTrade) return; // Strict lock check
+
+    if (state.candles.length < 3) {
+        // Not enough data yet
+        return;
+    }
+
+    // ... (rest of function)
+}
+
+// ... (existing code) ...
+
+// ============ TRADE EXECUTION ============
+async function executeTrade(action) {
+    if (state.isProcessingTrade) {
+        addLog(`⚠️ Skipping ${action} - Trade already in progress`, 'info');
+        return;
+    }
+
+    state.isProcessingTrade = true;
+    addLog(`📤 Sending ${action} signal to DeTrade...`, 'info');
+
+    try {
+        if (!state.detradeTabId) {
+            const found = await findDetradeTab();
+            if (!found) {
+                addLog('❌ Cannot execute trade - DeTrade tab not found', 'error');
+                return;
+            }
+        }
+
+        // First ensure content script is injected
+        await injectContentScript(state.detradeTabId);
+
+        // Small delay to let content script initialize
+        await new Promise(r => setTimeout(r, 100));
+
+        // Send trade command
+        const response = await chrome.tabs.sendMessage(state.detradeTabId, {
+            type: 'EXECUTE_TRADE',
+            action: action
+        });
+
+        if (response && response.success) {
+            addLog(`✅ ${action} executed successfully!`, 'success');
+
+            if (action === 'BUY') {
+                state.position = { type: 'LONG', entryPrice: state.currentPrice, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+            } else if (action === 'SELL') {
+                state.position = { type: 'SHORT', entryPrice: state.currentPrice, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+            } else if (action === 'CLOSE') {
+                state.position = { type: 'NONE', entryPrice: 0, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+            }
+
+            updatePositionDisplay();
+        } else {
+            addLog(`❌ Trade failed: ${response?.error || 'Unknown error'}`, 'error');
+        }
+    } catch (error) {
+        addLog(`❌ Error: ${error.message}`, 'error');
+
+        // Try to re-find the tab
+        state.detradeTabId = null;
+        await findDetradeTab();
+    } finally {
+        // Release the lock after a short safety delay to ensure UI settles
+        setTimeout(() => {
+            state.isProcessingTrade = false;
+        }, 1000);
+    }
+}
 
 // ============ CHART SETUP ============
 let chart = null;
@@ -152,7 +237,7 @@ async function startPriceScraping() {
     // Set up interval to fetch prices
     setInterval(async () => {
         await fetchCurrentPrice();
-    }, 1000);
+    }, 50);
 }
 
 async function fetchCurrentPrice() {
@@ -162,100 +247,116 @@ async function fetchCurrentPrice() {
         const results = await chrome.scripting.executeScript({
             target: { tabId: state.detradeTabId },
             func: () => {
-                // STRATEGY: Find the STONKS price displayed near the symbol name
-                // Format on DeTrade: "STONKS ↓ 936.02 ▲ +7.84%"
+                // STRATEGY: Find the main price by looking for the LARGEST numeric text on screen
 
-                // Method 1: Find STONKS element and get the price next to it
-                // Look for elements containing "STONKS" text
+                // Helper to parse price string
+                const parsePrice = (str) => {
+                    const clean = str.replace(/[^0-9.]/g, '');
+                    return parseFloat(clean);
+                };
+
+                const candidates = [];
                 const allElements = document.querySelectorAll('*');
+
                 for (const el of allElements) {
-                    const text = el.textContent?.trim();
-                    // Match elements that have STONKS followed by price
-                    // Pattern: STONKS [maybe ↓/↑] 936.02
-                    if (text && text.includes('STONKS') && !text.includes('Demo account')) {
-                        const match = text.match(/STONKS[^0-9]*(\d{3,4}\.\d{2})/);
-                        if (match) {
-                            const price = parseFloat(match[1]);
-                            if (price > 0) {
-                                return { price, source: 'stonks_element', debug: match[0] };
+                    // Skip hidden elements, inputs, and scripts
+                    if (el.offsetParent === null) continue;
+                    if (['INPUT', 'SELECT', 'SCRIPT', 'STYLE'].includes(el.tagName)) continue;
+
+                    // Get text and clean it
+                    const text = el.innerText?.trim();
+                    if (!text) continue;
+
+                    // Strict number check
+                    if (/^[$€£]?\s*\d{1,3}(,\d{3})*(\.\d+)?$/.test(text) || /^\d+(\.\d+)?$/.test(text)) {
+                        const price = parsePrice(text);
+
+                        // Filter out unreasonably small integers that look like UI elements unless they are very large text
+                        if (!isNaN(price) && price > 0) {
+                            const style = window.getComputedStyle(el);
+                            const fontSize = parseFloat(style.fontSize);
+                            const fontWeight = parseFloat(style.fontWeight) || 400;
+
+                            let score = fontSize * 10; // Base score on size
+
+                            // Weight bold text
+                            if (fontWeight > 500) score += 5;
+
+                            // Penalize integer 1 (often a default qty)
+                            if (price === 1 && fontSize < 20) score -= 100;
+
+                            // Bonus for color (green/red/up/down) indicating change
+                            const color = style.color;
+                            if (el.className.includes('green') || el.className.includes('red') ||
+                                (color !== 'rgb(0, 0, 0)' && color !== 'rgb(255, 255, 255)')) {
+                                score += 20;
                             }
+
+                            candidates.push({ price, score, debug: text, elClass: el.className });
                         }
                     }
                 }
 
-                // Method 2: Look for the price in the header area (near Round ends)
-                // The price format is like "936.02" with green/red coloring
-                const headerArea = document.querySelector('[class*="header"], [class*="symbol"], [class*="pair"]');
-                if (headerArea) {
-                    const text = headerArea.innerText;
-                    const match = text.match(/(\d{3,4}\.\d{2})/);
-                    if (match) {
-                        const price = parseFloat(match[1]);
-                        // Exclude account balance (usually has comma like 1,146.787)
-                        if (price > 0 && !match[0].includes(',')) {
-                            return { price, source: 'header_area', debug: match[0] };
-                        }
+                // Sort by score descending (Largest font wins)
+                candidates.sort((a, b) => b.score - a.score);
+
+                // Position scraping
+                let positionCount = 0;
+                try {
+                    const allElements = document.querySelectorAll('*');
+                    for (const el of allElements) {
+                        try {
+                            if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+                            if (el.children.length > 0) continue; // Only check leaf nodes or text nodes
+
+                            const text = el.textContent.trim();
+                            const match = text.match(/Positions\s*\(\s*(\d+)\s*\)/i);
+                            if (match) {
+                                positionCount = parseInt(match[1], 10);
+                                break;
+                            }
+                        } catch (e) { }
                     }
+                } catch (e) { }
+
+                if (candidates.length > 0) {
+                    return {
+                        price: candidates[0].price,
+                        source: 'largest_font',
+                        debug: candidates[0],
+                        positions: positionCount
+                    };
                 }
 
-                // Method 3: Find the first large price display
-                // Look for standalone price elements (without comma = not account balance)
-                const priceElements = [];
-                document.querySelectorAll('span, div').forEach(el => {
-                    const text = el.textContent?.trim();
-                    // Match exactly a price like "936.02" without commas
-                    if (text && /^\d{3,4}\.\d{2}$/.test(text)) {
-                        const price = parseFloat(text);
-                        priceElements.push({ el, price, text });
-                    }
-                });
-
-                // Sort by price value (higher prices first, as STONKS price is usually prominent)
-                priceElements.sort((a, b) => b.price - a.price);
-
-                // Return the first price that's not on the chart axis (axis prices usually repeat)
-                // Group by price and filter unique
-                const uniquePrices = [...new Set(priceElements.map(p => p.price))];
-                if (uniquePrices.length > 0) {
-                    // The live price is usually shown once, chart axis shows multiples
-                    for (const price of uniquePrices) {
-                        const count = priceElements.filter(p => p.price === price).length;
-                        if (count <= 2) { // Live price shows 1-2 times, axis shows more
-                            return { price, source: 'unique_price', debug: `price=${price}, count=${count}` };
-                        }
-                    }
-                    // Fallback to highest price
-                    return { price: uniquePrices[0], source: 'highest_price', debug: uniquePrices[0] };
-                }
-
-                // Method 4: Parse from full page text, looking for STONKS price pattern
-                const fullText = document.body.innerText;
-                // Pattern: STONKS ↓ 936.02 or STONKS/USDT 936.02
-                const fullMatch = fullText.match(/STONKS[\/\s↓↑▲▼]*(\d{3,4}\.\d{2})/i);
-                if (fullMatch) {
-                    return { price: parseFloat(fullMatch[1]), source: 'full_text', debug: fullMatch[0] };
-                }
-
-                // Method 5: Look for green/red colored price (live price indicator)
-                const coloredEls = document.querySelectorAll('[style*="rgb(38, 166"], [style*="rgb(239, 83"], [class*="green"], [class*="red"]');
-                for (const el of coloredEls) {
-                    const text = el.textContent?.trim();
-                    if (text && /^\d{3,4}\.\d{2}$/.test(text)) {
-                        return { price: parseFloat(text), source: 'colored_element', debug: text };
-                    }
-                }
-
-                return null;
+                return { price: null, positions: positionCount };
             }
         });
 
         if (results && results[0] && results[0].result) {
-            const { price, source, debug } = results[0].result;
-            console.log(`[DeTrade Bot] Price: ${price} from ${source}`, debug);
+            const { price, source, debug, positions } = results[0].result;
 
-            updatePrice(price);
-            buildCandle(price);
-            checkStrategy();
+            // Update real positions
+            if (typeof positions === 'number') {
+                state.realPositions = positions;
+                // Optional: visual indicator of real positions vs bot positions
+            }
+
+            if (price) {
+                // Optimization: Always update Logic, but throttle UI/Chart
+                const now = Date.now();
+
+                // 1. Update Strategy/Logic (Every 50ms)
+                state.currentPrice = price;
+                checkStrategy();
+
+                // 2. Update UI/Chart (Throttle to 1s to save CPU)
+                if (now - state.lastChartUpdate >= 1000) {
+                    console.log(`[DeTrade Bot] Price: ${price}, Positions: ${positions}`);
+                    updatePrice(price);
+                    buildCandle(price);
+                    state.lastChartUpdate = now;
+                }
+            }
         }
     } catch (error) {
         console.error('Price fetch error:', error);
@@ -316,23 +417,10 @@ function getTimeframeSeconds(tf) {
     return map[tf] || 15;
 }
 
-// ============ EMA CALCULATION ============
-function calculateEMA(prices, period) {
-    if (prices.length < period) return null;
-
-    const k = 2 / (period + 1);
-    let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-
-    for (let i = period; i < prices.length; i++) {
-        ema = prices[i] * k + ema * (1 - k);
-    }
-
-    return ema;
-}
 
 function updateEMA() {
     const closePrices = state.candles.map(c => c.close);
-    const ema = calculateEMA(closePrices, state.emaPeriod);
+    const ema = Strategy.calculateEMA(closePrices, state.emaPeriod);
 
     if (ema) {
         state.ema = ema;
@@ -362,6 +450,8 @@ function updateEMA() {
     }
 }
 
+// getEMASlope moved to Strategy.js
+
 // ============ STRATEGY LOGIC ============
 function checkStrategy() {
     // Allow trading with fewer candles for faster start
@@ -383,40 +473,21 @@ function checkStrategy() {
 
     // Entry Logic
     if (state.position.type === 'NONE') {
-        if (hasEma) {
-            // EMA crossover strategy
-            const previousClose = previousCandle.close;
+        // Use separate Strategy Module
+        const signal = Strategy.getSignal(state);
 
-            // BUY Signal: Price crosses above EMA
-            if (previousClose < state.ema && currentPrice > state.ema) {
-                addLog('🔔 BUY SIGNAL: Price crossed above EMA', 'trade');
+        if (signal) {
+            if (signal.type === 'BUY') {
+                addLog(`🔔 BUY SIGNAL: ${signal.reason}`, 'trade');
                 updateSignal('BUY', 'buy');
                 executeTrade('BUY');
-                return;
-            }
-
-            // SELL Signal: Price crosses below EMA
-            if (previousClose > state.ema && currentPrice < state.ema) {
-                addLog('🔔 SELL SIGNAL: Price crossed below EMA', 'trade');
+            } else if (signal.type === 'SELL') {
+                addLog(`🔔 SELL SIGNAL: ${signal.reason}`, 'trade');
                 updateSignal('SELL', 'sell');
                 executeTrade('SELL');
-                return;
-            }
-        } else {
-            // Momentum-based entry when EMA not ready
-            // Buy on strong upward momentum
-            if (priceDirection > 0.5) {
-                addLog('🔔 BUY SIGNAL: Strong upward momentum', 'trade');
-                updateSignal('BUY', 'buy');
-                executeTrade('BUY');
-                return;
-            }
-            // Sell on strong downward momentum
-            if (priceDirection < -0.5) {
-                addLog('🔔 SELL SIGNAL: Strong downward momentum', 'trade');
-                updateSignal('SELL', 'sell');
-                executeTrade('SELL');
-                return;
+            } else if (signal.type === 'SKIP') {
+                // Optional: Log skips
+                // addLog(`⚠️ Skipped: ${signal.reason}`, 'info');
             }
         }
     }
