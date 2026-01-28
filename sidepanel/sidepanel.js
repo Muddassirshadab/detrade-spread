@@ -8,9 +8,12 @@
 const state = {
     isConnected: false,
     isProcessingTrade: false, // Lock to prevent concurrent trades
+    lastTradeTime: 0, // Cooldown timestamp
+    tradeCooldown: 5000, // 5 second cooldown between trades
     currentPrice: 0,
     previousPrice: 0,
     candles: [],
+    // Single EMA 15
     ema: 0,
     emaHistory: [],
     position: {
@@ -18,10 +21,12 @@ const state = {
         entryPrice: 0,
         pnl: 0,
         highestPnl: 0, // For trailing SL
-
+        highestPnlPercent: 0, // For % based trailing
         lowestPnl: 0   // For tracking
     },
     realPositions: 0, // Real positions from website
+    realPnl: 0, // Real floating PnL from DOM (in $)
+    realPnlPercent: 0, // Real floating PnL% from DOM
     botEnabled: false,
     botStats: {
         trades: 0,
@@ -29,98 +34,18 @@ const state = {
         totalPnl: 0
     },
     currentTimeframe: '15s',
-    emaPeriod: 10, // Reduced from 50 for faster signals
+    emaPeriod: 15, // EMA period
     detradeTabId: null,
     priceHistory: [],
-    // Trailing SL config
+    // Trailing SL config - PERCENTAGE BASED
     trailingConfig: {
-        trailAmount: 0.1, // Super tight trail
-        minProfit: 0.1,   // Start trailing immediately
-        maxLoss: 0.2      // Very tight hard stop
+        stopLossPercent: -5,   // Exit at -5%
+        trailStartPercent: 2,  // Start trailing at +2%
+        trailAmount: 1         // Trail by 1%
     },
     // Optimization: separate logic loop from UI loop
-    lastChartUpdate: 0,
-    // Strategy Config (Sync with strategy.js if needed, or just use defaults)
-    emaPeriod: 10
+    lastChartUpdate: 0
 };
-
-// ... (existing code) ...
-
-// ============ STRATEGY LOGIC ============
-function checkStrategy() {
-    // Allow trading with fewer candles for faster start
-    if (!state.botEnabled) return;
-    if (state.isProcessingTrade) return; // Strict lock check
-
-    if (state.candles.length < 3) {
-        // Not enough data yet
-        return;
-    }
-
-    // ... (rest of function)
-}
-
-// ... (existing code) ...
-
-// ============ TRADE EXECUTION ============
-async function executeTrade(action) {
-    if (state.isProcessingTrade) {
-        addLog(`⚠️ Skipping ${action} - Trade already in progress`, 'info');
-        return;
-    }
-
-    state.isProcessingTrade = true;
-    addLog(`📤 Sending ${action} signal to DeTrade...`, 'info');
-
-    try {
-        if (!state.detradeTabId) {
-            const found = await findDetradeTab();
-            if (!found) {
-                addLog('❌ Cannot execute trade - DeTrade tab not found', 'error');
-                return;
-            }
-        }
-
-        // First ensure content script is injected
-        await injectContentScript(state.detradeTabId);
-
-        // Small delay to let content script initialize
-        await new Promise(r => setTimeout(r, 100));
-
-        // Send trade command
-        const response = await chrome.tabs.sendMessage(state.detradeTabId, {
-            type: 'EXECUTE_TRADE',
-            action: action
-        });
-
-        if (response && response.success) {
-            addLog(`✅ ${action} executed successfully!`, 'success');
-
-            if (action === 'BUY') {
-                state.position = { type: 'LONG', entryPrice: state.currentPrice, pnl: 0, highestPnl: 0, lowestPnl: 0 };
-            } else if (action === 'SELL') {
-                state.position = { type: 'SHORT', entryPrice: state.currentPrice, pnl: 0, highestPnl: 0, lowestPnl: 0 };
-            } else if (action === 'CLOSE') {
-                state.position = { type: 'NONE', entryPrice: 0, pnl: 0, highestPnl: 0, lowestPnl: 0 };
-            }
-
-            updatePositionDisplay();
-        } else {
-            addLog(`❌ Trade failed: ${response?.error || 'Unknown error'}`, 'error');
-        }
-    } catch (error) {
-        addLog(`❌ Error: ${error.message}`, 'error');
-
-        // Try to re-find the tab
-        state.detradeTabId = null;
-        await findDetradeTab();
-    } finally {
-        // Release the lock after a short safety delay to ensure UI settles
-        setTimeout(() => {
-            state.isProcessingTrade = false;
-        }, 1000);
-    }
-}
 
 // ============ CHART SETUP ============
 let chart = null;
@@ -163,10 +88,11 @@ function initChart() {
         wickDownColor: '#ef5350'
     });
 
+    // Single EMA 15 (Yellow)
     emaSeries = chart.addLineSeries({
         color: '#ffca28',
         lineWidth: 2,
-        title: 'EMA 50'
+        title: 'EMA 15'
     });
 
     // Handle resize
@@ -300,14 +226,18 @@ async function fetchCurrentPrice() {
                 // Sort by score descending (Largest font wins)
                 candidates.sort((a, b) => b.score - a.score);
 
-                // Position scraping
+                // Position and PnL% scraping
                 let positionCount = 0;
+                let floatingPnl = 0;
+                let floatingPnlPercent = 0;
+
                 try {
+                    // First find position count from "Positions(X)" text
                     const allElements = document.querySelectorAll('*');
                     for (const el of allElements) {
                         try {
                             if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
-                            if (el.children.length > 0) continue; // Only check leaf nodes or text nodes
+                            if (el.children.length > 0) continue;
 
                             const text = el.textContent.trim();
                             const match = text.match(/Positions\s*\(\s*(\d+)\s*\)/i);
@@ -317,6 +247,39 @@ async function fetchCurrentPrice() {
                             }
                         } catch (e) { }
                     }
+
+                    // If there are positions, scrape PnL% from table
+                    if (positionCount > 0) {
+                        // Find table rows in positions table
+                        const tables = document.querySelectorAll('table');
+                        for (const table of tables) {
+                            const rows = table.querySelectorAll('tbody tr');
+                            if (rows.length > 0) {
+                                const row = rows[0]; // First position
+                                const cells = row.querySelectorAll('td');
+
+                                // Look for cells with PnL values (typically columns 5-6)
+                                for (const cell of cells) {
+                                    const text = cell.textContent.trim();
+
+                                    // Match Floating PnL (e.g., "-$2.449" or "$5.20")
+                                    const pnlMatch = text.match(/^[+-]?\$?([\d,.]+)$/);
+                                    if (pnlMatch && !floatingPnl) {
+                                        const val = parseFloat(text.replace(/[$,]/g, ''));
+                                        if (!isNaN(val) && Math.abs(val) < 10000) {
+                                            floatingPnl = val;
+                                        }
+                                    }
+
+                                    // Match Floating PnL% (e.g., "-244.96%" or "+5.25%")
+                                    const pctMatch = text.match(/^([+-]?[\d,.]+)\s*%$/);
+                                    if (pctMatch) {
+                                        floatingPnlPercent = parseFloat(pctMatch[1].replace(/,/g, ''));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } catch (e) { }
 
                 if (candidates.length > 0) {
@@ -324,21 +287,31 @@ async function fetchCurrentPrice() {
                         price: candidates[0].price,
                         source: 'largest_font',
                         debug: candidates[0],
-                        positions: positionCount
+                        positions: positionCount,
+                        floatingPnl: floatingPnl,
+                        floatingPnlPercent: floatingPnlPercent
                     };
                 }
 
-                return { price: null, positions: positionCount };
+                return { price: null, positions: positionCount, floatingPnl: 0, floatingPnlPercent: 0 };
             }
         });
 
         if (results && results[0] && results[0].result) {
-            const { price, source, debug, positions } = results[0].result;
+            const { price, source, debug, positions, floatingPnl, floatingPnlPercent } = results[0].result;
 
-            // Update real positions
+            // Update real positions and PnL
             if (typeof positions === 'number') {
                 state.realPositions = positions;
-                // Optional: visual indicator of real positions vs bot positions
+            }
+
+            // Store real PnL% from DOM
+            if (positions > 0) {
+                state.realPnl = floatingPnl || 0;
+                state.realPnlPercent = floatingPnlPercent || 0;
+            } else {
+                state.realPnl = 0;
+                state.realPnlPercent = 0;
             }
 
             if (price) {
@@ -351,7 +324,11 @@ async function fetchCurrentPrice() {
 
                 // 2. Update UI/Chart (Throttle to 1s to save CPU)
                 if (now - state.lastChartUpdate >= 1000) {
-                    console.log(`[DeTrade Bot] Price: ${price}, Positions: ${positions}`);
+                    if (positions > 0) {
+                        console.log(`[DeTrade Bot] Price: ${price}, Positions: ${positions}, PnL%: ${floatingPnlPercent}%`);
+                    } else {
+                        console.log(`[DeTrade Bot] Price: ${price}, No positions`);
+                    }
                     updatePrice(price);
                     buildCandle(price);
                     state.lastChartUpdate = now;
@@ -420,22 +397,24 @@ function getTimeframeSeconds(tf) {
 
 function updateEMA() {
     const closePrices = state.candles.map(c => c.close);
-    const ema = Strategy.calculateEMA(closePrices, state.emaPeriod);
+    const period = state.emaPeriod; // 15
+
+    const ema = Strategy.calculateEMA(closePrices, period);
 
     if (ema) {
         state.ema = ema;
-        document.getElementById('emaValue').textContent = `EMA(${state.emaPeriod}): ${ema.toFixed(2)}`;
+        document.getElementById('emaValue').textContent = `EMA(${period}): ${ema.toFixed(2)}`;
 
-        // Update EMA line on chart - rebuild entire series
+        // Build EMA history for chart
         state.emaHistory = [];
-        const k = 2 / (state.emaPeriod + 1);
+        const k = 2 / (period + 1);
         let runningEma = null;
 
         for (let i = 0; i < state.candles.length; i++) {
-            if (i < state.emaPeriod - 1) continue;
+            if (i < period - 1) continue;
 
             if (runningEma === null) {
-                runningEma = closePrices.slice(0, state.emaPeriod).reduce((a, b) => a + b, 0) / state.emaPeriod;
+                runningEma = closePrices.slice(0, period).reduce((a, b) => a + b, 0) / period;
             } else {
                 runningEma = closePrices[i] * k + runningEma * (1 - k);
             }
@@ -454,26 +433,77 @@ function updateEMA() {
 
 // ============ STRATEGY LOGIC ============
 function checkStrategy() {
-    // Allow trading with fewer candles for faster start
+    // Pre-checks
     if (!state.botEnabled) return;
-    if (state.candles.length < 3) {
-        // Not enough data yet
+    if (state.candles.length < 20) return; // Need enough for EMA15
+    if (state.isProcessingTrade) return;
+
+    // Cooldown check
+    const timeSinceLastTrade = Date.now() - state.lastTradeTime;
+    if (timeSinceLastTrade < state.tradeCooldown) {
         return;
     }
 
     const currentPrice = state.currentPrice;
-    const lastCandle = state.candles[state.candles.length - 1];
-    const previousCandle = state.candles[state.candles.length - 2];
 
-    if (!previousCandle) return;
+    // ============ EXIT LOGIC (Real PnL% based) ============
+    // Check exits first - use REAL PnL% from DOM
+    if (state.realPositions > 0 && state.position.type !== 'NONE') {
+        const { stopLossPercent, trailStartPercent, trailAmount } = state.trailingConfig;
+        const realPnlPct = state.realPnlPercent;
 
-    // Simple momentum-based entry (works without EMA too)
-    const priceDirection = lastCandle.close - previousCandle.close;
-    const hasEma = state.ema && state.candles.length >= state.emaPeriod;
+        // Update highest PnL% for trailing
+        if (realPnlPct > state.position.highestPnlPercent) {
+            state.position.highestPnlPercent = realPnlPct;
+        }
 
-    // Entry Logic
-    if (state.position.type === 'NONE') {
-        // Use separate Strategy Module
+        // Log current PnL% periodically
+        if (Date.now() - state.lastChartUpdate < 100) {
+            addLog(`📊 Real PnL: ${state.realPnl >= 0 ? '+' : ''}$${state.realPnl.toFixed(2)} (${realPnlPct >= 0 ? '+' : ''}${realPnlPct.toFixed(2)}%)`, 'info');
+        }
+
+        updatePositionDisplay();
+
+        // STOP LOSS: Exit if loss exceeds threshold
+        if (realPnlPct <= stopLossPercent) {
+            addLog(`❌ STOP LOSS HIT! PnL: ${realPnlPct.toFixed(2)}% (threshold: ${stopLossPercent}%)`, 'error');
+            executeTrade('CLOSE');
+            recordTradeResult(state.realPnl);
+            return;
+        }
+
+        // TRAILING STOP: If profit was above trailStart and dropped by trailAmount
+        if (state.position.highestPnlPercent >= trailStartPercent) {
+            const dropFromPeak = state.position.highestPnlPercent - realPnlPct;
+
+            if (dropFromPeak >= trailAmount) {
+                addLog(`📈 TRAILING SL! Peak: +${state.position.highestPnlPercent.toFixed(2)}%, Exit: ${realPnlPct.toFixed(2)}%`, 'success');
+                executeTrade('CLOSE');
+                recordTradeResult(state.realPnl);
+                return;
+            }
+        }
+
+        // Currently in position, don't take new trades
+        return;
+    }
+
+    // ============ ENTRY LOGIC (EMA Crossover) ============
+    // Only enter when no real positions exist
+    if (state.realPositions > 0) {
+        // Sync internal state if needed
+        if (state.position.type === 'NONE') {
+            addLog(`📊 Detected ${state.realPositions} real position(s) on website`, 'info');
+        }
+        return;
+    }
+
+    // Need EMA for entry
+    if (!state.ema) return;
+    if (state.emaHistory.length < 2) return;
+
+    // Entry - only when no positions
+    if (state.position.type === 'NONE' && state.realPositions === 0) {
         const signal = Strategy.getSignal(state);
 
         if (signal) {
@@ -486,55 +516,8 @@ function checkStrategy() {
                 updateSignal('SELL', 'sell');
                 executeTrade('SELL');
             } else if (signal.type === 'SKIP') {
-                // Optional: Log skips
                 // addLog(`⚠️ Skipped: ${signal.reason}`, 'info');
             }
-        }
-    }
-
-    // Exit Logic: Trailing Stop Loss
-    if (state.position.type !== 'NONE') {
-        const pnl = state.position.type === 'LONG'
-            ? currentPrice - state.position.entryPrice
-            : state.position.entryPrice - currentPrice;
-
-        state.position.pnl = pnl;
-
-        // Update highest P&L for trailing
-        if (pnl > state.position.highestPnl) {
-            state.position.highestPnl = pnl;
-        }
-
-        updatePositionDisplay();
-
-        const { trailAmount, minProfit, maxLoss } = state.trailingConfig;
-
-        // Hard Stop Loss: Exit immediately if loss exceeds max
-        if (pnl <= -maxLoss) {
-            addLog(`❌ STOP LOSS HIT! P&L: ${pnl.toFixed(2)}`, 'error');
-            executeTrade('CLOSE');
-            recordTradeResult(pnl);
-            return;
-        }
-
-        // Trailing Stop Loss: If we had profit and it dropped by trailAmount
-        if (state.position.highestPnl >= minProfit) {
-            const dropFromPeak = state.position.highestPnl - pnl;
-
-            if (dropFromPeak >= trailAmount) {
-                addLog(`📈 TRAILING SL! Peak: +${state.position.highestPnl.toFixed(2)}, Exit: +${pnl.toFixed(2)}`, 'success');
-                executeTrade('CLOSE');
-                recordTradeResult(pnl);
-                return;
-            }
-        }
-
-        // Quick profit book: If profit > 2 points and starts dropping
-        if (pnl >= 2 && state.position.highestPnl - pnl >= 0.3) {
-            addLog(`✅ QUICK PROFIT! P&L: +${pnl.toFixed(2)}`, 'success');
-            executeTrade('CLOSE');
-            recordTradeResult(pnl);
-            return;
         }
     }
 }
@@ -554,12 +537,23 @@ function recordTradeResult(pnl) {
 
 // ============ TRADE EXECUTION ============
 async function executeTrade(action) {
+    // Double-check lock before executing
+    if (state.isProcessingTrade) {
+        addLog(`⚠️ Trade ${action} blocked: Already processing`, 'info');
+        return;
+    }
+
+    // Set lock IMMEDIATELY
+    state.isProcessingTrade = true;
+    state.lastTradeTime = Date.now();
+
     addLog(`📤 Sending ${action} signal to DeTrade...`, 'info');
 
     if (!state.detradeTabId) {
         const found = await findDetradeTab();
         if (!found) {
             addLog('❌ Cannot execute trade - DeTrade tab not found', 'error');
+            state.isProcessingTrade = false;
             return;
         }
     }
@@ -589,6 +583,11 @@ async function executeTrade(action) {
             }
 
             updatePositionDisplay();
+
+            // Wait for website to update position data
+            addLog(`⏳ Waiting for position confirmation...`, 'info');
+            await new Promise(r => setTimeout(r, 2000));
+
         } else {
             addLog(`❌ Trade failed: ${response?.error || 'Unknown error'}`, 'error');
         }
@@ -598,6 +597,12 @@ async function executeTrade(action) {
         // Try to re-find the tab
         state.detradeTabId = null;
         await findDetradeTab();
+    } finally {
+        // Release lock after additional safety delay
+        setTimeout(() => {
+            state.isProcessingTrade = false;
+            addLog(`🔓 Trade lock released, cooldown: ${state.tradeCooldown / 1000}s`, 'info');
+        }, 1000);
     }
 }
 
@@ -731,7 +736,7 @@ function setupEventListeners() {
             state.currentTimeframe = tf;
             document.getElementById('currentTimeframe').textContent = tf;
 
-            // Clear candles for new timeframe
+            // Clear candles and EMA for new timeframe
             state.candles = [];
             state.emaHistory = [];
             candleSeries.setData([]);
