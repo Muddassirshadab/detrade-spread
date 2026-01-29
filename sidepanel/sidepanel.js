@@ -226,61 +226,102 @@ async function fetchCurrentPrice() {
                 // Sort by score descending (Largest font wins)
                 candidates.sort((a, b) => b.score - a.score);
 
-                // Position and PnL% scraping
+                // Position and PnL% scraping - IMPROVED VERSION
                 let positionCount = 0;
                 let floatingPnl = 0;
                 let floatingPnlPercent = 0;
 
                 try {
-                    // First find position count from "Positions(X)" text
-                    const allElements = document.querySelectorAll('*');
-                    for (const el of allElements) {
-                        try {
-                            if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
-                            if (el.children.length > 0) continue;
-
-                            const text = el.textContent.trim();
-                            const match = text.match(/Positions\s*\(\s*(\d+)\s*\)/i);
-                            if (match) {
-                                positionCount = parseInt(match[1], 10);
-                                break;
-                            }
-                        } catch (e) { }
+                    // METHOD 1: Find position count from "Positions(X)" text anywhere on page
+                    const bodyText = document.body.innerText;
+                    const posMatch = bodyText.match(/Positions\s*\(\s*(\d+)\s*\)/i);
+                    if (posMatch) {
+                        positionCount = parseInt(posMatch[1], 10);
                     }
 
-                    // If there are positions, scrape PnL% from table
+                    console.log('[DeTrade Scraper] Position count:', positionCount);
+
+                    // METHOD 2: If positions found, scrape PnL from table
                     if (positionCount > 0) {
-                        // Find table rows in positions table
+                        // Find the positions table - usually the one with position data
                         const tables = document.querySelectorAll('table');
+
                         for (const table of tables) {
                             const rows = table.querySelectorAll('tbody tr');
-                            if (rows.length > 0) {
-                                const row = rows[0]; // First position
-                                const cells = row.querySelectorAll('td');
+                            if (rows.length === 0) continue;
 
-                                // Look for cells with PnL values (typically columns 5-6)
-                                for (const cell of cells) {
-                                    const text = cell.textContent.trim();
+                            // Get column headers to find correct columns
+                            const headers = table.querySelectorAll('thead th, thead td');
+                            let floatingPnlColIdx = -1;
+                            let floatingPnlPctColIdx = -1;
 
-                                    // Match Floating PnL (e.g., "-$2.449" or "$5.20")
-                                    const pnlMatch = text.match(/^[+-]?\$?([\d,.]+)$/);
-                                    if (pnlMatch && !floatingPnl) {
-                                        const val = parseFloat(text.replace(/[$,]/g, ''));
-                                        if (!isNaN(val) && Math.abs(val) < 10000) {
-                                            floatingPnl = val;
+                            headers.forEach((th, idx) => {
+                                const headerText = th.textContent.trim().toLowerCase();
+                                if (headerText.includes('floating pnl') && headerText.includes('%')) {
+                                    floatingPnlPctColIdx = idx;
+                                } else if (headerText.includes('floating pnl') && !headerText.includes('%')) {
+                                    floatingPnlColIdx = idx;
+                                }
+                            });
+
+                            console.log('[DeTrade Scraper] Found columns - PnL:', floatingPnlColIdx, 'PnL%:', floatingPnlPctColIdx);
+
+                            // Get first row (first position)
+                            const row = rows[0];
+                            const cells = row.querySelectorAll('td');
+
+                            // If we found the column indices, use them
+                            if (floatingPnlPctColIdx >= 0 && cells[floatingPnlPctColIdx]) {
+                                const pctText = cells[floatingPnlPctColIdx].textContent.trim();
+                                // Extract number from text like "+84.27%" or "-5.5%"
+                                const pctMatch = pctText.match(/([+-]?\d+\.?\d*)/);
+                                if (pctMatch) {
+                                    floatingPnlPercent = parseFloat(pctMatch[1]);
+                                    console.log('[DeTrade Scraper] PnL% from column:', floatingPnlPercent);
+                                }
+                            }
+
+                            if (floatingPnlColIdx >= 0 && cells[floatingPnlColIdx]) {
+                                const pnlText = cells[floatingPnlColIdx].textContent.trim();
+                                const pnlMatch = pnlText.match(/([+-]?\d+\.?\d*)/);
+                                if (pnlMatch) {
+                                    floatingPnl = parseFloat(pnlMatch[1]);
+                                    console.log('[DeTrade Scraper] PnL from column:', floatingPnl);
+                                }
+                            }
+
+                            // FALLBACK: If column headers not found, scan all cells
+                            if (floatingPnlPercent === 0) {
+                                for (let i = 0; i < cells.length; i++) {
+                                    const cellText = cells[i].textContent.trim();
+
+                                    // Look for percentage value (contains %)
+                                    if (cellText.includes('%')) {
+                                        const match = cellText.match(/([+-]?\d+\.?\d*)\s*%/);
+                                        if (match) {
+                                            const val = parseFloat(match[1]);
+                                            // Floating PnL% is usually larger absolute value
+                                            if (Math.abs(val) > Math.abs(floatingPnlPercent)) {
+                                                floatingPnlPercent = val;
+                                                console.log('[DeTrade Scraper] PnL% from scan:', floatingPnlPercent, 'cell:', i);
+                                            }
                                         }
-                                    }
-
-                                    // Match Floating PnL% (e.g., "-244.96%" or "+5.25%")
-                                    const pctMatch = text.match(/^([+-]?[\d,.]+)\s*%$/);
-                                    if (pctMatch) {
-                                        floatingPnlPercent = parseFloat(pctMatch[1].replace(/,/g, ''));
                                     }
                                 }
                             }
+
+                            // If we found data, stop looking at other tables
+                            if (floatingPnlPercent !== 0 || floatingPnl !== 0) {
+                                break;
+                            }
                         }
                     }
-                } catch (e) { }
+
+                    console.log('[DeTrade Scraper] Final - Positions:', positionCount, 'PnL:', floatingPnl, 'PnL%:', floatingPnlPercent);
+
+                } catch (e) {
+                    console.error('[DeTrade Scraper] Error:', e);
+                }
 
                 if (candidates.length > 0) {
                     return {
@@ -312,6 +353,23 @@ async function fetchCurrentPrice() {
             } else {
                 state.realPnl = 0;
                 state.realPnlPercent = 0;
+
+                // CRITICAL SYNC: If website shows 0 positions but bot thinks there's a position,
+                // reset the internal state immediately
+                if (state.position.type !== 'NONE') {
+                    console.log('[DeTrade Bot] Website shows 0 positions, resetting internal state');
+                    addLog(`🔄 Position closed on website - syncing state`, 'info');
+                    state.position = {
+                        type: 'NONE',
+                        entryPrice: 0,
+                        pnl: 0,
+                        highestPnl: 0,
+                        highestPnlPercent: 0,
+                        lowestPnl: 0
+                    };
+                    updatePositionDisplay();
+                    updateSignal('WAITING');
+                }
             }
 
             if (price) {
@@ -331,6 +389,7 @@ async function fetchCurrentPrice() {
                     }
                     updatePrice(price);
                     buildCandle(price);
+                    updatePositionDisplay(); // Update position PnL display
                     state.lastChartUpdate = now;
                 }
             }
@@ -448,9 +507,19 @@ function checkStrategy() {
 
     // ============ EXIT LOGIC (Real PnL% based) ============
     // Check exits first - use REAL PnL% from DOM
-    if (state.realPositions > 0 && state.position.type !== 'NONE') {
+    // IMPORTANT: Only check realPositions, not internal state - position might be manually opened
+    if (state.realPositions > 0) {
         const { stopLossPercent, trailStartPercent, trailAmount } = state.trailingConfig;
         const realPnlPct = state.realPnlPercent;
+
+        // Sync internal state if position was opened manually
+        if (state.position.type === 'NONE') {
+            // Detected an external position - sync the state
+            state.position.type = 'EXTERNAL';
+            state.position.entryPrice = state.currentPrice;
+            state.position.highestPnlPercent = realPnlPct;
+            addLog(`📊 Detected ${state.realPositions} real position(s) on website - syncing`, 'info');
+        }
 
         // Update highest PnL% for trailing
         if (realPnlPct > state.position.highestPnlPercent) {
@@ -489,13 +558,11 @@ function checkStrategy() {
     }
 
     // ============ ENTRY LOGIC (EMA Crossover) ============
-    // Only enter when no real positions exist
-    if (state.realPositions > 0) {
-        // Sync internal state if needed
-        if (state.position.type === 'NONE') {
-            addLog(`📊 Detected ${state.realPositions} real position(s) on website`, 'info');
-        }
-        return;
+    // Only enter when no real positions exist on website
+    // Reset internal state when no positions on website
+    if (state.position.type !== 'NONE') {
+        addLog(`📊 No positions on website - resetting internal state`, 'info');
+        state.position = { type: 'NONE', entryPrice: 0, pnl: 0, highestPnl: 0, highestPnlPercent: 0, lowestPnl: 0 };
     }
 
     // Need EMA for entry
@@ -635,15 +702,31 @@ function updatePositionDisplay() {
     const entryEl = document.getElementById('entryPrice');
     const pnlEl = document.getElementById('currentPnl');
 
-    typeEl.textContent = state.position.type;
-    typeEl.style.color = state.position.type === 'LONG' ? '#26a69a' :
-        state.position.type === 'SHORT' ? '#ef5350' : '#a0a0c0';
+    // Show position type - use realPositions to determine if there's a position
+    if (state.realPositions > 0) {
+        // Position exists on website
+        const posType = state.position.type !== 'NONE' ? state.position.type : 'OPEN';
+        typeEl.textContent = posType;
+        typeEl.style.color = posType === 'LONG' ? '#26a69a' :
+            posType === 'SHORT' ? '#ef5350' : '#ffca28'; // Yellow for unknown/external
+    } else {
+        typeEl.textContent = 'NONE';
+        typeEl.style.color = '#a0a0c0';
+    }
 
     entryEl.textContent = state.position.entryPrice > 0 ?
         state.position.entryPrice.toFixed(2) : '---.--';
 
-    const pnl = state.position.pnl;
-    pnlEl.textContent = `$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`;
+    // Use REAL PnL from website, not internal state
+    const pnl = state.realPnl;
+    const pnlPct = state.realPnlPercent;
+
+    if (state.realPositions > 0 && (pnl !== 0 || pnlPct !== 0)) {
+        // Show real PnL with percentage
+        pnlEl.textContent = `$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`;
+    } else {
+        pnlEl.textContent = '$0.00';
+    }
     pnlEl.className = `pos-value pnl ${pnl >= 0 ? 'positive' : 'negative'}`;
 }
 
