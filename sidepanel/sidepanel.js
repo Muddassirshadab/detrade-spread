@@ -19,11 +19,14 @@ const state = {
     position: {
         type: 'NONE', // 'LONG', 'SHORT', 'NONE'
         entryPrice: 0,
+        entryTime: 0, // Timestamp for time-based exit
         pnl: 0,
         highestPnl: 0, // For trailing SL
         highestPnlPercent: 0, // For % based trailing
-        lowestPnl: 0   // For tracking
+        lowestPnl: 0,   // For tracking
+        breakEvenActivated: false // Track if SL moved to breakeven
     },
+    internalPnlPercent: 0, // Calculated PnL (not from DOM)
     realPositions: 0, // Real positions from website
     realPnl: 0, // Real floating PnL from DOM (in $)
     realPnlPercent: 0, // Real floating PnL% from DOM
@@ -37,11 +40,13 @@ const state = {
     emaPeriod: 15, // EMA period
     detradeTabId: null,
     priceHistory: [],
-    // Trailing SL config - PERCENTAGE BASED
+    // Trailing SL config - TIGHT FOR HIGH LEVERAGE
     trailingConfig: {
-        stopLossPercent: -5,   // Exit at -5%
-        trailStartPercent: 2,  // Start trailing at +2%
-        trailAmount: 1         // Trail by 1%
+        stopLossPercent: -0.5,     // Exit at -0.5% loss (tight for leverage)
+        breakEvenTrigger: 0.2,     // Move SL to 0% when +0.2% profit
+        trailStartPercent: 0.3,    // Start trailing at +0.3%
+        trailAmount: 0.2,          // Trail by 0.2% drop from peak
+        timeoutSeconds: 45         // Exit if no profit after 45 seconds
     },
     // Optimization: separate logic loop from UI loop
     lastChartUpdate: 0
@@ -504,100 +509,151 @@ function checkStrategy() {
     }
 
     const currentPrice = state.currentPrice;
+    const config = state.trailingConfig;
 
-    // ============ EXIT LOGIC (Real PnL% based) ============
-    // Check exits first - use REAL PnL% from DOM
-    // IMPORTANT: Only check realPositions, not internal state - position might be manually opened
-    if (state.realPositions > 0) {
-        const { stopLossPercent, trailStartPercent, trailAmount } = state.trailingConfig;
-        const realPnlPct = state.realPnlPercent;
+    // ============ EXIT LOGIC (Internal PnL Calculation) ============
+    // Check if we have an active position (internal state)
+    if (state.position.type !== 'NONE' && state.position.entryPrice > 0) {
 
-        // Sync internal state if position was opened manually
-        if (state.position.type === 'NONE') {
-            // Detected an external position - sync the state
-            state.position.type = 'EXTERNAL';
-            state.position.entryPrice = state.currentPrice;
-            state.position.highestPnlPercent = realPnlPct;
-            addLog(`📊 Detected ${state.realPositions} real position(s) on website - syncing`, 'info');
+        // Calculate PnL internally based on entry price
+        let pnlPercent = 0;
+        if (state.position.type === 'LONG') {
+            pnlPercent = ((currentPrice - state.position.entryPrice) / state.position.entryPrice) * 100;
+        } else if (state.position.type === 'SHORT') {
+            pnlPercent = ((state.position.entryPrice - currentPrice) / state.position.entryPrice) * 100;
+        } else if (state.position.type === 'EXTERNAL') {
+            // For external positions, use DOM PnL if available, else calculate
+            pnlPercent = state.realPnlPercent !== 0 ? state.realPnlPercent :
+                ((currentPrice - state.position.entryPrice) / state.position.entryPrice) * 100;
         }
 
-        // Update highest PnL% for trailing
-        if (realPnlPct > state.position.highestPnlPercent) {
-            state.position.highestPnlPercent = realPnlPct;
+        // Store internal PnL
+        state.internalPnlPercent = pnlPercent;
+
+        // Update highest PnL for trailing
+        if (pnlPercent > state.position.highestPnlPercent) {
+            state.position.highestPnlPercent = pnlPercent;
         }
 
-        // Log current PnL% periodically
+        // Log PnL periodically (every chart update)
         if (Date.now() - state.lastChartUpdate < 100) {
-            addLog(`📊 Real PnL: ${state.realPnl >= 0 ? '+' : ''}$${state.realPnl.toFixed(2)} (${realPnlPct >= 0 ? '+' : ''}${realPnlPct.toFixed(2)}%)`, 'info');
+            const pnlDisplay = pnlPercent >= 0 ? `+${pnlPercent.toFixed(3)}%` : `${pnlPercent.toFixed(3)}%`;
+            addLog(`📊 Internal PnL: ${pnlDisplay} | Peak: +${state.position.highestPnlPercent.toFixed(3)}%`, 'info');
         }
 
         updatePositionDisplay();
 
-        // STOP LOSS: Exit if loss exceeds threshold
-        if (realPnlPct <= stopLossPercent) {
-            addLog(`❌ STOP LOSS HIT! PnL: ${realPnlPct.toFixed(2)}% (threshold: ${stopLossPercent}%)`, 'error');
+        // ---- EXIT CHECKS ----
+
+        // 1. STOP LOSS: Exit if loss exceeds threshold
+        if (pnlPercent <= config.stopLossPercent) {
+            addLog(`❌ STOP LOSS! PnL: ${pnlPercent.toFixed(3)}% (limit: ${config.stopLossPercent}%)`, 'error');
             executeTrade('CLOSE');
-            recordTradeResult(state.realPnl);
+            recordTradeResult(pnlPercent);
             return;
         }
 
-        // TRAILING STOP: If profit was above trailStart and dropped by trailAmount
-        if (state.position.highestPnlPercent >= trailStartPercent) {
-            const dropFromPeak = state.position.highestPnlPercent - realPnlPct;
+        // 2. TIME-BASED EXIT: Exit if no profit after timeout
+        const timeInTrade = (Date.now() - state.position.entryTime) / 1000;
+        if (timeInTrade >= config.timeoutSeconds && pnlPercent <= 0) {
+            addLog(`⏰ TIMEOUT EXIT! ${timeInTrade.toFixed(0)}s, PnL: ${pnlPercent.toFixed(3)}%`, 'error');
+            executeTrade('CLOSE');
+            recordTradeResult(pnlPercent);
+            return;
+        }
 
-            if (dropFromPeak >= trailAmount) {
-                addLog(`📈 TRAILING SL! Peak: +${state.position.highestPnlPercent.toFixed(2)}%, Exit: ${realPnlPct.toFixed(2)}%`, 'success');
+        // 3. BREAKEVEN ACTIVATION: Move SL to 0 when profit hits trigger
+        if (!state.position.breakEvenActivated && pnlPercent >= config.breakEvenTrigger) {
+            state.position.breakEvenActivated = true;
+            addLog(`🔒 BREAKEVEN ACTIVATED! PnL: +${pnlPercent.toFixed(3)}% - SL moved to 0%`, 'success');
+        }
+
+        // 4. BREAKEVEN EXIT: If breakeven activated and price dropped back to 0
+        if (state.position.breakEvenActivated && pnlPercent <= 0) {
+            addLog(`🔒 BREAKEVEN EXIT! PnL dropped to ${pnlPercent.toFixed(3)}%`, 'info');
+            executeTrade('CLOSE');
+            recordTradeResult(pnlPercent);
+            return;
+        }
+
+        // 5. TRAILING STOP: If profit was above trailStart and dropped by trailAmount
+        if (state.position.highestPnlPercent >= config.trailStartPercent) {
+            const dropFromPeak = state.position.highestPnlPercent - pnlPercent;
+
+            if (dropFromPeak >= config.trailAmount) {
+                addLog(`📈 TRAILING SL! Peak: +${state.position.highestPnlPercent.toFixed(3)}%, Exit: ${pnlPercent.toFixed(3)}%`, 'success');
                 executeTrade('CLOSE');
-                recordTradeResult(state.realPnl);
+                recordTradeResult(pnlPercent);
                 return;
             }
         }
 
-        // Currently in position, don't take new trades
+        // Still in position, don't take new trades
         return;
     }
 
-    // ============ ENTRY LOGIC (EMA Crossover) ============
-    // Only enter when no real positions exist on website
-    // Reset internal state when no positions on website
-    if (state.position.type !== 'NONE') {
-        addLog(`📊 No positions on website - resetting internal state`, 'info');
-        state.position = { type: 'NONE', entryPrice: 0, pnl: 0, highestPnl: 0, highestPnlPercent: 0, lowestPnl: 0 };
+    // ============ SYNC WITH WEBSITE ============
+    // If website shows positions but we don't track one, sync
+    if (state.realPositions > 0 && state.position.type === 'NONE') {
+        state.position.type = 'EXTERNAL';
+        state.position.entryPrice = currentPrice;
+        state.position.entryTime = Date.now();
+        state.position.highestPnlPercent = state.realPnlPercent || 0;
+        state.position.breakEvenActivated = false;
+        addLog(`📊 Detected ${state.realPositions} position(s) on website - syncing`, 'info');
+        return;
     }
+
+    // ============ ENTRY LOGIC (Score-based) ============
+    // Only enter when no positions (internal or external)
+    if (state.realPositions > 0) return; // Website has position
 
     // Need EMA for entry
     if (!state.ema) return;
     if (state.emaHistory.length < 2) return;
 
-    // Entry - only when no positions
-    if (state.position.type === 'NONE' && state.realPositions === 0) {
-        const signal = Strategy.getSignal(state);
+    // Get signal from strategy
+    const signal = Strategy.getSignal(state);
 
-        if (signal) {
-            if (signal.type === 'BUY') {
-                addLog(`🔔 BUY SIGNAL: ${signal.reason}`, 'trade');
-                updateSignal('BUY', 'buy');
-                executeTrade('BUY');
-            } else if (signal.type === 'SELL') {
-                addLog(`🔔 SELL SIGNAL: ${signal.reason}`, 'trade');
-                updateSignal('SELL', 'sell');
-                executeTrade('SELL');
-            } else if (signal.type === 'SKIP') {
-                // addLog(`⚠️ Skipped: ${signal.reason}`, 'info');
-            }
+    if (signal) {
+        if (signal.type === 'BUY') {
+            addLog(`🔔 BUY SIGNAL: ${signal.reason}`, 'trade');
+            updateSignal(`BUY (${signal.score})`, 'buy');
+            executeTrade('BUY');
+        } else if (signal.type === 'SELL') {
+            addLog(`🔔 SELL SIGNAL: ${signal.reason}`, 'trade');
+            updateSignal(`SELL (${signal.score})`, 'sell');
+            executeTrade('SELL');
+        } else if (signal.type === 'SKIP') {
+            // Uncomment to debug weak signals
+            // addLog(`⚠️ ${signal.reason}`, 'info');
         }
     }
 }
 
-function recordTradeResult(pnl) {
+function recordTradeResult(pnlPercent) {
     state.botStats.trades++;
-    state.botStats.totalPnl += pnl;
-    if (pnl > 0) state.botStats.wins++;
+    // Note: pnlPercent is used for win/loss calculation
+    // For actual $ PnL, we'd need position size which varies
+    state.botStats.totalPnl += pnlPercent; // Store as % for now
+    if (pnlPercent > 0) state.botStats.wins++;
+
+    addLog(`📊 Trade Result: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(3)}%`, pnlPercent >= 0 ? 'success' : 'error');
 
     updateBotStats();
 
     // Reset position with all fields
-    state.position = { type: 'NONE', entryPrice: 0, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+    state.position = {
+        type: 'NONE',
+        entryPrice: 0,
+        entryTime: 0,
+        pnl: 0,
+        highestPnl: 0,
+        highestPnlPercent: 0,
+        lowestPnl: 0,
+        breakEvenActivated: false
+    };
+    state.internalPnlPercent = 0;
     updatePositionDisplay();
     updateSignal('WAITING');
 }
@@ -642,11 +698,40 @@ async function executeTrade(action) {
             addLog(`✅ ${action} executed successfully!`, 'success');
 
             if (action === 'BUY') {
-                state.position = { type: 'LONG', entryPrice: state.currentPrice, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+                state.position = {
+                    type: 'LONG',
+                    entryPrice: state.currentPrice,
+                    entryTime: Date.now(),
+                    pnl: 0,
+                    highestPnl: 0,
+                    highestPnlPercent: 0,
+                    lowestPnl: 0,
+                    breakEvenActivated: false
+                };
+                addLog(`📥 LONG @ ${state.currentPrice.toFixed(2)}`, 'success');
             } else if (action === 'SELL') {
-                state.position = { type: 'SHORT', entryPrice: state.currentPrice, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+                state.position = {
+                    type: 'SHORT',
+                    entryPrice: state.currentPrice,
+                    entryTime: Date.now(),
+                    pnl: 0,
+                    highestPnl: 0,
+                    highestPnlPercent: 0,
+                    lowestPnl: 0,
+                    breakEvenActivated: false
+                };
+                addLog(`📥 SHORT @ ${state.currentPrice.toFixed(2)}`, 'success');
             } else if (action === 'CLOSE') {
-                state.position = { type: 'NONE', entryPrice: 0, pnl: 0, highestPnl: 0, lowestPnl: 0 };
+                state.position = {
+                    type: 'NONE',
+                    entryPrice: 0,
+                    entryTime: 0,
+                    pnl: 0,
+                    highestPnl: 0,
+                    highestPnlPercent: 0,
+                    lowestPnl: 0,
+                    breakEvenActivated: false
+                };
             }
 
             updatePositionDisplay();
@@ -702,13 +787,14 @@ function updatePositionDisplay() {
     const entryEl = document.getElementById('entryPrice');
     const pnlEl = document.getElementById('currentPnl');
 
-    // Show position type - use realPositions to determine if there's a position
-    if (state.realPositions > 0) {
-        // Position exists on website
-        const posType = state.position.type !== 'NONE' ? state.position.type : 'OPEN';
-        typeEl.textContent = posType;
+    // Show position type based on internal state
+    if (state.position.type !== 'NONE') {
+        const posType = state.position.type;
+        // Add BE indicator if breakeven is activated
+        const beIndicator = state.position.breakEvenActivated ? ' 🔒' : '';
+        typeEl.textContent = posType + beIndicator;
         typeEl.style.color = posType === 'LONG' ? '#26a69a' :
-            posType === 'SHORT' ? '#ef5350' : '#ffca28'; // Yellow for unknown/external
+            posType === 'SHORT' ? '#ef5350' : '#ffca28'; // Yellow for external
     } else {
         typeEl.textContent = 'NONE';
         typeEl.style.color = '#a0a0c0';
@@ -717,17 +803,19 @@ function updatePositionDisplay() {
     entryEl.textContent = state.position.entryPrice > 0 ?
         state.position.entryPrice.toFixed(2) : '---.--';
 
-    // Use REAL PnL from website, not internal state
-    const pnl = state.realPnl;
-    const pnlPct = state.realPnlPercent;
+    // Use INTERNAL PnL calculation (not DOM scrape)
+    const pnlPct = state.internalPnlPercent;
 
-    if (state.realPositions > 0 && (pnl !== 0 || pnlPct !== 0)) {
-        // Show real PnL with percentage
-        pnlEl.textContent = `$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`;
+    if (state.position.type !== 'NONE' && state.position.entryPrice > 0) {
+        // Show internal PnL with peak
+        const pnlText = pnlPct >= 0 ? `+${pnlPct.toFixed(3)}%` : `${pnlPct.toFixed(3)}%`;
+        const peakText = state.position.highestPnlPercent > 0 ?
+            ` (Peak: +${state.position.highestPnlPercent.toFixed(2)}%)` : '';
+        pnlEl.textContent = pnlText + peakText;
     } else {
-        pnlEl.textContent = '$0.00';
+        pnlEl.textContent = '0.000%';
     }
-    pnlEl.className = `pos-value pnl ${pnl >= 0 ? 'positive' : 'negative'}`;
+    pnlEl.className = `pos-value pnl ${pnlPct >= 0 ? 'positive' : 'negative'}`;
 }
 
 function updateBotStats() {
@@ -738,7 +826,8 @@ function updateBotStats() {
 
     const totalPnl = state.botStats.totalPnl;
     const pnlEl = document.getElementById('totalPnl');
-    pnlEl.textContent = `$${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}`;
+    // Show cumulative PnL percentage
+    pnlEl.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}%`;
     pnlEl.style.color = totalPnl >= 0 ? '#26a69a' : '#ef5350';
 }
 
