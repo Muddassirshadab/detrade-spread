@@ -9,7 +9,7 @@ const state = {
     isConnected: false,
     isProcessingTrade: false, // Lock to prevent concurrent trades
     lastTradeTime: 0, // Cooldown timestamp
-    tradeCooldown: 5000, // 5 second cooldown between trades
+    tradeCooldown: 3000, // 3 second cooldown
     currentPrice: 0,
     previousPrice: 0,
     candles: [],
@@ -40,13 +40,14 @@ const state = {
     emaPeriod: 15, // EMA period
     detradeTabId: null,
     priceHistory: [],
-    // Trailing SL config - TIGHT FOR HIGH LEVERAGE
+    // Trailing SL config - ULTRA TIGHT FOR 505x LEVERAGE
+    // Liquidation at ~0.2%, so SL at 0.175% to exit BEFORE liquidation
     trailingConfig: {
-        stopLossPercent: -0.5,     // Exit at -0.5% loss (tight for leverage)
-        breakEvenTrigger: 0.2,     // Move SL to 0% when +0.2% profit
-        trailStartPercent: 0.3,    // Start trailing at +0.3%
-        trailAmount: 0.2,          // Trail by 0.2% drop from peak
-        timeoutSeconds: 45         // Exit if no profit after 45 seconds
+        stopLossPercent: -0.175,   // Exit at -0.175% (before 0.2% liquidation!)
+        breakEvenTrigger: 0.05,    // Move SL to 0% when +0.05% profit
+        trailStartPercent: 0.2,    // Start trailing at +0.2%
+        trailAmount: 0.05,         // Trail by 0.05% drop from peak
+        timeoutSeconds: 30         // Exit if no profit after 30 seconds
     },
     // Optimization: separate logic loop from UI loop
     lastChartUpdate: 0
@@ -736,25 +737,38 @@ async function executeTrade(action) {
 
             updatePositionDisplay();
 
-            // Wait for website to update position data
-            addLog(`⏳ Waiting for position confirmation...`, 'info');
-            await new Promise(r => setTimeout(r, 2000));
+            // Confirmation wait
+            addLog(`⏳ Confirming...`, 'info');
+            await new Promise(r => setTimeout(r, 1500));
 
         } else {
             addLog(`❌ Trade failed: ${response?.error || 'Unknown error'}`, 'error');
+
+            // If CLOSE failed (button not found), assume LIQUIDATION happened
+            if (action === 'CLOSE') {
+                addLog(`💀 LIQUIDATION DETECTED! Close button not found - position already gone`, 'error');
+                // Record as -100% loss (full liquidation)
+                recordTradeResult(-100);
+            }
         }
     } catch (error) {
         addLog(`❌ Error: ${error.message}`, 'error');
+
+        // If we were trying to close and got error, assume liquidation
+        if (state.position.type !== 'NONE') {
+            addLog(`💀 Possible LIQUIDATION - resetting state`, 'error');
+            recordTradeResult(-100);
+        }
 
         // Try to re-find the tab
         state.detradeTabId = null;
         await findDetradeTab();
     } finally {
-        // Release lock after additional safety delay
+        // Release lock faster for high-frequency trading
         setTimeout(() => {
             state.isProcessingTrade = false;
-            addLog(`🔓 Trade lock released, cooldown: ${state.tradeCooldown / 1000}s`, 'info');
-        }, 1000);
+            addLog(`🔓 Lock released`, 'info');
+        }, 300);
     }
 }
 
