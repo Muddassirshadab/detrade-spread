@@ -49,6 +49,11 @@ const state = {
         trailAmount: 0.05,         // Trail by 0.05% drop from peak
         timeoutSeconds: 30         // Exit if no profit after 30 seconds
     },
+    // Consecutive loss detection
+    consecutiveLosses: 0,          // Count of consecutive liquidations/losses
+    lastTradeDirection: null,      // 'BUY' or 'SELL' - last trade direction
+    directionFlipped: false,       // True if we flipped direction after 2 losses
+    flipCooldownUntil: 0,          // Timestamp - wait until this time after flip
     // Optimization: separate logic loop from UI loop
     lastChartUpdate: 0
 };
@@ -605,7 +610,7 @@ function checkStrategy() {
         return;
     }
 
-    // ============ ENTRY LOGIC (Score-based) ============
+    // ============ ENTRY LOGIC (Score-based with Time-Based Flip) ============
     // Only enter when no positions (internal or external)
     if (state.realPositions > 0) return; // Website has position
 
@@ -613,22 +618,40 @@ function checkStrategy() {
     if (!state.ema) return;
     if (state.emaHistory.length < 2) return;
 
+    // Check if flip period has expired (auto-deactivate after 5-10 seconds)
+    if (state.directionFlipped && state.flipCooldownUntil > 0 && Date.now() > state.flipCooldownUntil) {
+        state.directionFlipped = false;
+        state.consecutiveLosses = 0; // Reset counter too
+        addLog(`✅ Flip period ended. Back to NORMAL signals.`, 'info');
+    }
+
     // Get signal from strategy
     const signal = Strategy.getSignal(state);
 
-    if (signal) {
-        if (signal.type === 'BUY') {
-            addLog(`🔔 BUY SIGNAL: ${signal.reason}`, 'trade');
-            updateSignal(`BUY (${signal.score})`, 'buy');
-            executeTrade('BUY');
-        } else if (signal.type === 'SELL') {
-            addLog(`🔔 SELL SIGNAL: ${signal.reason}`, 'trade');
-            updateSignal(`SELL (${signal.score})`, 'sell');
-            executeTrade('SELL');
-        } else if (signal.type === 'SKIP') {
-            // Uncomment to debug weak signals
-            // addLog(`⚠️ ${signal.reason}`, 'info');
+    if (signal && (signal.type === 'BUY' || signal.type === 'SELL')) {
+        let finalDirection = signal.type;
+
+        // If direction flipped (during 5-10 sec window), take opposite trade
+        if (state.directionFlipped) {
+            finalDirection = signal.type === 'BUY' ? 'SELL' : 'BUY';
+            const remainingSec = ((state.flipCooldownUntil - Date.now()) / 1000).toFixed(1);
+            addLog(`🔄 FLIP! Signal=${signal.type} → Taking ${finalDirection} (${remainingSec}s left)`, 'trade');
         }
+
+        if (finalDirection === 'BUY') {
+            addLog(`🔔 BUY: ${signal.reason}`, 'trade');
+            updateSignal(`BUY (${signal.score})`, 'buy');
+            state.lastTradeDirection = 'BUY';
+            executeTrade('BUY');
+        } else if (finalDirection === 'SELL') {
+            addLog(`🔔 SELL: ${signal.reason}`, 'trade');
+            updateSignal(`SELL (${signal.score})`, 'sell');
+            state.lastTradeDirection = 'SELL';
+            executeTrade('SELL');
+        }
+    } else if (signal && signal.type === 'SKIP') {
+        // Uncomment to debug weak signals
+        // addLog(`⚠️ ${signal.reason}`, 'info');
     }
 }
 
@@ -637,9 +660,27 @@ function recordTradeResult(pnlPercent) {
     // Note: pnlPercent is used for win/loss calculation
     // For actual $ PnL, we'd need position size which varies
     state.botStats.totalPnl += pnlPercent; // Store as % for now
-    if (pnlPercent > 0) state.botStats.wins++;
 
-    addLog(`📊 Trade Result: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(3)}%`, pnlPercent >= 0 ? 'success' : 'error');
+    const isLoss = pnlPercent < 0;
+    const isLiquidation = pnlPercent <= -50; // -100% or similar = liquidation
+
+    if (isLoss) {
+        // Increment consecutive loss counter
+        state.consecutiveLosses++;
+        addLog(`📊 LOSS #${state.consecutiveLosses}: ${pnlPercent.toFixed(3)}%`, 'error');
+
+        // After 2 consecutive losses, flip direction for 10 seconds
+        if (state.consecutiveLosses >= 2) {
+            state.directionFlipped = true;
+            state.flipCooldownUntil = Date.now() + 10000; // Flip active for 10 seconds
+            addLog(`🔄 2 consecutive losses! FLIP MODE for 10 seconds`, 'error');
+        }
+    } else {
+        // Win - reset consecutive loss counter
+        state.consecutiveLosses = 0;
+        state.botStats.wins++;
+        addLog(`📊 WIN: +${pnlPercent.toFixed(3)}%`, 'success');
+    }
 
     updateBotStats();
 
