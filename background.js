@@ -253,9 +253,132 @@ chrome.action.onClicked.addListener((tab) => {
 // ============ SIDE PANEL BEHAVIOR ============
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
+// ============ TELEGRAM BOT INTEGRATION ============
+const TELEGRAM_CONFIG = {
+    token: '7952430230:AAGyuZojBXkU4GRGEdDnpWFn9LVwrRaCHAs',
+    chatId: '-5247390756',
+    offset: 0
+};
+
+const BOT_STATE = {
+    isRunning: false, // Mirrored from storage
+    lastCapital: '0.00',
+    lastPrice: 0
+};
+
+// Initialize State from Storage
+chrome.storage.local.get(['botEnabled'], (result) => {
+    if (result) {
+        BOT_STATE.isRunning = result.botEnabled || false;
+    }
+});
+
+async function sendTelegramMessage(text) {
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_CONFIG.token}/sendMessage`;
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: TELEGRAM_CONFIG.chatId,
+                text: text,
+                parse_mode: 'Markdown'
+            })
+        });
+    } catch (error) {
+        console.error('[BG] Telegram Send Error:', error);
+    }
+}
+
+async function pollTelegramUpdates() {
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_CONFIG.token}/getUpdates?offset=${TELEGRAM_CONFIG.offset + 1}&timeout=10`;
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.ok && data.result.length > 0) {
+            for (const update of data.result) {
+                TELEGRAM_CONFIG.offset = update.update_id;
+
+                if (update.message && update.message.text) {
+                    const text = update.message.text.trim();
+                    if (update.message.chat.id.toString() !== TELEGRAM_CONFIG.chatId) continue;
+                    handleTelegramCommand(text);
+                }
+            }
+        }
+    } catch (error) {
+        // Network errors are common in background poll, just retry
+    }
+
+    // Poll again immediately
+    setTimeout(pollTelegramUpdates, 1000);
+}
+
+function handleTelegramCommand(command) {
+    console.log('[BG] Command received:', command);
+
+    if (command === '/start') {
+        if (!BOT_STATE.isRunning) {
+            // Set Storage -> Sidepanel picks it up
+            chrome.storage.local.set({ botEnabled: true });
+            BOT_STATE.isRunning = true;
+            sendTelegramMessage('🚀 *Bot ENABLED* via Telegram!');
+        } else {
+            sendTelegramMessage('⚠️ Bot is already RUNNING.');
+        }
+    } else if (command === '/stop') {
+        if (BOT_STATE.isRunning) {
+            // Set Storage -> Sidepanel picks it up
+            chrome.storage.local.set({ botEnabled: false });
+            BOT_STATE.isRunning = false;
+            sendTelegramMessage('zzZ *Bot DISABLED* via Telegram.');
+        } else {
+            sendTelegramMessage('⚠️ Bot is already STOPPED.');
+        }
+    } else if (command === '/capital') {
+        sendTelegramMessage(`💰 *Current Capital:* ${BOT_STATE.lastCapital} USDT`);
+    } else if (command === '/status') {
+        sendTelegramMessage(`ℹ️ *Status:* ${BOT_STATE.isRunning ? 'RUNNING 🟢' : 'STOPPED 🔴'}\n💰 Capital: ${BOT_STATE.lastCapital} USDT`);
+    }
+}
+
+// Start polling
+pollTelegramUpdates();
+
+// ============ STORAGE LISTENER ============
+chrome.storage.onChanged.addListener((changes, namespace) => {
+    if (namespace !== 'local') return;
+
+    if (changes.lastCapital) {
+        BOT_STATE.lastCapital = changes.lastCapital.newValue;
+    }
+
+    if (changes.lastPrice) {
+        BOT_STATE.lastPrice = changes.lastPrice.newValue;
+    }
+
+    if (changes.botEnabled) {
+        BOT_STATE.isRunning = changes.botEnabled.newValue;
+    }
+});
+
+// ============ MESSAGE LISTENER (Legacy/Misc) ============
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Keep GET_BOT_STATE for initial sync if needed (though storage is better)
+    if (message.type === 'GET_BOT_STATE') {
+        sendResponse(BOT_STATE);
+    }
+
+    return false;
+});
+
+
 // ============ INSTALLATION ============
 chrome.runtime.onInstalled.addListener(() => {
     console.log('[BG] DeTrade Trading Bot installed');
+    // Default to OFF on install
+    chrome.storage.local.set({ botEnabled: false });
 });
 
 console.log('[BG] Background service worker started');

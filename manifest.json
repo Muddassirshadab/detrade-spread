@@ -13,7 +13,9 @@
   "host_permissions": [
     "https://detrade.com/*",
     "https://*.detrade.com/*",
-    "wss://websocket.detrade.com/*"
+    "https://*.detrade.com/*",
+    "wss://websocket.detrade.com/*",
+    "https://api.telegram.org/*"
   ],
   "side_panel": {
     "default_path": "sidepanel/sidepanel.html"

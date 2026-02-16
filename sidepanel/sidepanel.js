@@ -37,16 +37,15 @@ const state = {
         totalPnl: 0
     },
     currentTimeframe: '15s',
-    emaPeriod: 15, // EMA period
+    emaPeriod: 10, // EMA period
     detradeTabId: null,
     priceHistory: [],
-    // Trailing SL config - ULTRA TIGHT FOR 505x LEVERAGE
-    // Liquidation at ~0.2%, so SL at 0.175% to exit BEFORE liquidation
+    // Trailing SL config
     trailingConfig: {
-        stopLossPercent: -0.175,   // Exit at -0.175% (before 0.2% liquidation!)
-        breakEvenTrigger: 0.05,    // Move SL to 0% when +0.05% profit
-        trailStartPercent: 0.2,    // Start trailing at +0.2%
-        trailAmount: 0.05,         // Trail by 0.05% drop from peak
+        stopLossPercent: -0.4,     // Exit at -0.4% loss
+        breakEvenTrigger: 0.02,    // Move SL to 0% when +0.02% profit (super tight)
+        trailStartPercent: 0.05,   // Start trailing at +0.05%
+        trailAmount: 0.02,         // Trail by 0.02% drop from peak
         timeoutSeconds: 30         // Exit if no profit after 30 seconds
     },
     // Consecutive loss detection
@@ -110,6 +109,41 @@ function initChart() {
     new ResizeObserver(() => {
         chart.applyOptions({ width: container.clientWidth });
     }).observe(container);
+
+    // STORAGE LISTENER FOR SYNCED CONTROL (Telegram <-> Sidepanel)
+    chrome.storage.onChanged.addListener((changes, namespace) => {
+        if (namespace === 'local') {
+            // Bot State Sync
+            if (changes.botEnabled) {
+                const newValue = changes.botEnabled.newValue;
+                if (newValue !== state.botEnabled) {
+                    toggleBot(newValue);
+                    if (newValue) {
+                        addLog('🚀 Bot STARTED (Synced)', 'success');
+                    } else {
+                        addLog('zzZ Bot STOPPED (Synced)', 'warning');
+                    }
+                }
+            }
+
+            // Capital Sync
+            if (changes.lastCapital) {
+                const capEl = document.getElementById('currentCapital');
+                if (capEl) capEl.textContent = `${changes.lastCapital.newValue} USDT`;
+            }
+        }
+    });
+
+    // Initial State Sync
+    chrome.storage.local.get(['botEnabled', 'lastCapital'], (result) => {
+        if (result.botEnabled && !state.botEnabled) {
+            toggleBot(true);
+        }
+        if (result.lastCapital) {
+            const capEl = document.getElementById('currentCapital');
+            if (capEl) capEl.textContent = `${result.lastCapital} USDT`;
+        }
+    });
 }
 
 // ============ DETRADE TAB CONNECTION ============
@@ -366,20 +400,14 @@ async function fetchCurrentPrice() {
                 state.realPnlPercent = 0;
 
                 // CRITICAL SYNC: If website shows 0 positions but bot thinks there's a position,
-                // reset the internal state immediately
+                // this means it was LIQUIDATED or manually closed instantly using other means
                 if (state.position.type !== 'NONE') {
-                    console.log('[DeTrade Bot] Website shows 0 positions, resetting internal state');
-                    addLog(`🔄 Position closed on website - syncing state`, 'info');
-                    state.position = {
-                        type: 'NONE',
-                        entryPrice: 0,
-                        pnl: 0,
-                        highestPnl: 0,
-                        highestPnlPercent: 0,
-                        lowestPnl: 0
-                    };
-                    updatePositionDisplay();
-                    updateSignal('WAITING');
+                    // Only trigger if we've had the position for at least 500ms (to avoid race condition during entry)
+                    if (Date.now() - state.position.entryTime > 500) {
+                        console.log('[DeTrade Bot] Website shows 0 positions, detecting LIQUIDATION');
+                        addLog(`💀 Position disappeared from website - Assuming LIQUIDATION`, 'error');
+                        recordTradeResult(-100); // Record as max loss to trigger flip/cooldown
+                    }
                 }
             }
 
@@ -467,7 +495,7 @@ function getTimeframeSeconds(tf) {
 
 function updateEMA() {
     const closePrices = state.candles.map(c => c.close);
-    const period = state.emaPeriod; // 15
+    const period = state.emaPeriod; // 10
 
     const ema = Strategy.calculateEMA(closePrices, period);
 
@@ -629,13 +657,18 @@ function checkStrategy() {
     const signal = Strategy.getSignal(state);
 
     if (signal && (signal.type === 'BUY' || signal.type === 'SELL')) {
-        let finalDirection = signal.type;
+        // STRATEGY: Default is REVERSE (Buy->Sell) because of 8% win rate
+        // IF 2 consecutive losses -> FLIP to NORMAL (Buy->Buy) for 10 seconds
 
-        // If direction flipped (during 5-10 sec window), take opposite trade
+        let finalDirection = signal.type === 'BUY' ? 'SELL' : 'BUY'; // Default: REVERSE
+
+        // If flip is active (after 2 consecutive losses), REVERT TO NORMAL
         if (state.directionFlipped) {
-            finalDirection = signal.type === 'BUY' ? 'SELL' : 'BUY';
+            finalDirection = signal.type; // Back to Normal (Buy->Buy)
             const remainingSec = ((state.flipCooldownUntil - Date.now()) / 1000).toFixed(1);
-            addLog(`🔄 FLIP! Signal=${signal.type} → Taking ${finalDirection} (${remainingSec}s left)`, 'trade');
+            addLog(`🔄 FLIP TO NORMAL! Signal=${signal.type} → Taking ${finalDirection} (${remainingSec}s left)`, 'trade');
+        } else {
+            addLog(`🔀 REVERSE MODE (Default): Signal ${signal.type} → executed as ${finalDirection}`, 'trade');
         }
 
         if (finalDirection === 'BUY') {
@@ -669,11 +702,11 @@ function recordTradeResult(pnlPercent) {
         state.consecutiveLosses++;
         addLog(`📊 LOSS #${state.consecutiveLosses}: ${pnlPercent.toFixed(3)}%`, 'error');
 
-        // After 2 consecutive losses, flip direction for 10 seconds
+        // After 2 consecutive losses, wait 10 seconds
         if (state.consecutiveLosses >= 2) {
             state.directionFlipped = true;
-            state.flipCooldownUntil = Date.now() + 10000; // Flip active for 10 seconds
-            addLog(`🔄 2 consecutive losses! FLIP MODE for 10 seconds`, 'error');
+            state.flipCooldownUntil = Date.now() + 10000; // Wait 10 seconds
+            addLog(`🛑 2 consecutive losses! Waiting 10 seconds...`, 'error');
         }
     } else {
         // Win - reset consecutive loss counter
@@ -781,6 +814,18 @@ async function executeTrade(action) {
             // Confirmation wait
             addLog(`⏳ Confirming...`, 'info');
             await new Promise(r => setTimeout(r, 1500));
+
+            // CRITICAL CHECK: If position is NOT found after wait, assume instant liquidation
+            if (state.realPositions === 0) {
+                if (state.position.type !== 'NONE') {
+                    addLog(`💀 Position not found after execution - Assuming INSTANT LIQUIDATION`, 'error');
+                    recordTradeResult(-100);
+                } else {
+                    addLog(`ℹ️ Position already cleaned up (likely by scraper)`, 'info');
+                }
+            } else {
+                addLog(`✅ Trade confirmed active`, 'success');
+            }
 
         } else {
             addLog(`❌ Trade failed: ${response?.error || 'Unknown error'}`, 'error');
@@ -917,6 +962,30 @@ function addLog(message, type = 'info') {
     }
 }
 
+// ============ HELPER FUNCTIONS ============
+function toggleBot(shouldEnable) {
+    const toggleEl = document.getElementById('botToggle');
+    const statusEl = document.getElementById('botStatus');
+
+    if (!toggleEl || !statusEl) return;
+
+    // Prevent redundant updates if already in state
+    if (state.botEnabled === shouldEnable && toggleEl.checked === shouldEnable) return;
+
+    state.botEnabled = shouldEnable;
+    toggleEl.checked = shouldEnable;
+
+    if (shouldEnable) {
+        statusEl.textContent = '🟢 Bot is RUNNING';
+        statusEl.className = 'bot-status-text active';
+        addLog('🤖 Bot Agent ENABLED', 'success');
+    } else {
+        statusEl.textContent = 'Bot is OFF';
+        statusEl.className = 'bot-status-text';
+        addLog('🤖 Bot Agent DISABLED', 'info');
+    }
+}
+
 // ============ EVENT LISTENERS ============
 function setupEventListeners() {
     // Buy button
@@ -937,20 +1006,10 @@ function setupEventListeners() {
         executeTrade('CLOSE');
     });
 
-    // Bot toggle
+    // Bot toggle (User Click) -> Update Storage (Single Source of Truth)
     document.getElementById('botToggle').addEventListener('change', (e) => {
-        state.botEnabled = e.target.checked;
-        const statusEl = document.getElementById('botStatus');
-
-        if (state.botEnabled) {
-            statusEl.textContent = '🟢 Bot is RUNNING';
-            statusEl.className = 'bot-status-text active';
-            addLog('🤖 Bot Agent STARTED', 'success');
-        } else {
-            statusEl.textContent = 'Bot is OFF';
-            statusEl.className = 'bot-status-text';
-            addLog('🤖 Bot Agent STOPPED', 'info');
-        }
+        const isChecked = e.target.checked;
+        chrome.storage.local.set({ botEnabled: isChecked });
     });
 
     // Timeframe buttons

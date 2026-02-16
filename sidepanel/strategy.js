@@ -5,7 +5,7 @@
 
 const Strategy = {
     // Config
-    emaPeriod: 15,
+    emaPeriod: 10,
     slopeThreshold: 0.01,       // Reduced for faster signals
     bufferPoints: 10,           // Price must be X points away from EMA
     minScore: 3,                // Minimum score to take trade
@@ -38,7 +38,7 @@ const Strategy = {
     // Check if candles show momentum
     getMomentumScore(candles, direction) {
         if (candles.length < 3) return 0;
-        
+
         const last3 = candles.slice(-3);
         let score = 0;
 
@@ -123,14 +123,14 @@ const Strategy = {
 
             // Check if score meets threshold
             if (buyScore >= this.minScore) {
-                return { 
-                    type: 'BUY', 
+                return {
+                    type: 'BUY',
                     score: buyScore,
                     reason: `Score ${buyScore}: ${reasons.join(', ')}`
                 };
             } else if (buyScore > 0) {
-                return { 
-                    type: 'SKIP', 
+                return {
+                    type: 'SKIP',
                     reason: `Weak BUY score ${buyScore}/${this.minScore}: ${reasons.join(', ')}`
                 };
             }
@@ -180,14 +180,14 @@ const Strategy = {
 
             // Check if score meets threshold
             if (sellScore >= this.minScore) {
-                return { 
-                    type: 'SELL', 
+                return {
+                    type: 'SELL',
                     score: sellScore,
                     reason: `Score ${sellScore}: ${reasons.join(', ')}`
                 };
             } else if (sellScore > 0) {
-                return { 
-                    type: 'SKIP', 
+                return {
+                    type: 'SKIP',
                     reason: `Weak SELL score ${sellScore}/${this.minScore}: ${reasons.join(', ')}`
                 };
             }
