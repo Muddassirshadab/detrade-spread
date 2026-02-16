@@ -395,6 +395,73 @@
         console.log('[DeTrade Bot] Price scraping started');
     }
 
+    // ============ MESSAGE LISTENER (RESTORED) ============
+    try {
+        chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+            if (!isExtensionValid) {
+                // Try to recover validity if context is back
+                if (checkExtensionContext()) {
+                    isExtensionValid = true;
+                } else {
+                    sendResponse({ error: 'Extension context invalid' });
+                    return true;
+                }
+            }
+
+            console.log('[DeTrade Bot] Received message:', message);
+
+            if (message.type === 'EXECUTE_TRADE') {
+                let result;
+
+                switch (message.action) {
+                    case 'BUY':
+                        result = executeBuy();
+                        break;
+                    case 'SELL':
+                        result = executeSell();
+                        break;
+                    case 'CLOSE':
+                        result = executeClose();
+                        break;
+                    default:
+                        result = { success: false, error: 'Unknown action' };
+                }
+
+                sendResponse(result);
+                return true;
+            }
+
+            if (message.type === 'GET_PRICE') {
+                const price = scrapeCurrentPrice();
+                sendResponse({ price });
+                return true;
+            }
+
+            if (message.type === 'GET_POSITIONS_COUNT') {
+                const count = getOpenPositionsCount();
+                sendResponse({ count });
+                return true;
+            }
+
+            if (message.type === 'START_SCRAPING') {
+                startPriceScraping();
+                sendResponse({ status: 'started' });
+                return true;
+            }
+
+            if (message.type === 'PING') {
+                sendResponse({ status: 'alive', url: window.location.href });
+                return true;
+            }
+
+            // Don't keep channel open for unknown messages
+            return false;
+        });
+    } catch (e) {
+        console.log('[DeTrade Bot] Failed to add message listener:', e);
+        isExtensionValid = false;
+    }
+
     // ============ CAPITAL SCRAPING ============
     function scrapeCapital() {
         try {
