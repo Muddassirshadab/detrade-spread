@@ -157,8 +157,14 @@
         if (!element) return false;
 
         try {
-            // Scroll into view
-            element.scrollIntoView({ behavior: 'instant', block: 'center' });
+            // Scroll into view (Try-Catch for RDP/Headless)
+            try {
+                if (element.scrollIntoView) {
+                    element.scrollIntoView({ behavior: 'instant', block: 'center' });
+                }
+            } catch (scrollError) {
+                // Ignore scroll errors in headless mode
+            }
 
             // Create and dispatch mouse events
             const events = ['mousedown', 'mouseup', 'click'];
@@ -269,8 +275,10 @@
         const allElements = document.querySelectorAll('*');
 
         for (const el of allElements) {
-            // Skip hidden elements, inputs, and scripts
-            if (el.offsetParent === null) continue;
+            // Skip hidden elements ONLY if explicitly hidden by CSS, not just off-screen
+            // if (el.offsetParent === null) continue; // REMOVED for RDP/Headless support
+
+            // Still skip non-content tags
             if (['INPUT', 'SELECT', 'SCRIPT', 'STYLE'].includes(el.tagName)) continue;
 
             const text = el.innerText?.trim();
@@ -328,9 +336,9 @@
 
                 if (match) {
                     // Start checking if it's visible or likely the tab
-                    if (el.offsetParent !== null) {
-                        return parseInt(match[1], 10);
-                    }
+                    // if (el.offsetParent !== null) { // REMOVED for RDP/Headless support
+                    return parseInt(match[1], 10);
+                    // }
                 }
             }
             return 0;
