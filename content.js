@@ -531,6 +531,22 @@
     }, 5000);
 
     // ============ INITIALIZATION ============
+
+    // Inject Keep Alive Script for RDP/Headless support
+    function injectKeepAlive() {
+        try {
+            const script = document.createElement('script');
+            script.src = chrome.runtime.getURL('keep_alive.js');
+            script.onload = function () {
+                this.remove();
+            };
+            (document.head || document.documentElement).appendChild(script);
+            console.log('[DeTrade Bot] Injected keep_alive.js for headless support');
+        } catch (e) {
+            console.error('[DeTrade Bot] Failed to inject catchup script:', e);
+        }
+    }
+
     // Notify that content script is ready
     safeSendMessage({
         type: 'CONTENT_SCRIPT_READY',
@@ -541,6 +557,8 @@
     if (window.location.href.includes('trade-center') ||
         window.location.href.includes('futures') ||
         window.location.href.includes('trading')) {
+
+        injectKeepAlive();
         startPriceScraping();
     }
 })();

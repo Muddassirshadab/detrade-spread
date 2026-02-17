@@ -24,6 +24,17 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sidepanel/styles.css",
+        "keep_alive.js"
+      ],
+      "matches": [
+        "https://*.detrade.com/*"
+      ]
+    }
+  ],
   "content_scripts": [
     {
       "matches": [
