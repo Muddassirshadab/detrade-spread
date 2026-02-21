@@ -1,21 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "DeTrade Trading Bot",
-  "version": "1.0.0",
-  "description": "Automated trading bot for DeTrade with side panel UI, manual trading, and EMA-based bot agent",
+  "name": "Trade Executor",
+  "version": "2.0.0",
+  "description": "Receives trade signals from server and executes on DeTrade",
   "permissions": [
     "activeTab",
     "storage",
     "sidePanel",
-    "scripting",
-    "tabs"
+    "tabs",
+    "alarms"
   ],
   "host_permissions": [
     "https://detrade.com/*",
     "https://*.detrade.com/*",
-    "https://*.detrade.com/*",
-    "wss://websocket.detrade.com/*",
-    "https://api.telegram.org/*"
+    "http://localhost/*"
   ],
   "side_panel": {
     "default_path": "sidepanel/sidepanel.html"
@@ -24,17 +22,6 @@
     "service_worker": "background.js",
     "type": "module"
   },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "sidepanel/styles.css",
-        "keep_alive.js"
-      ],
-      "matches": [
-        "https://*.detrade.com/*"
-      ]
-    }
-  ],
   "content_scripts": [
     {
       "matches": [
@@ -48,7 +35,7 @@
     }
   ],
   "action": {
-    "default_title": "Open DeTrade Bot",
+    "default_title": "Trade Executor",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DeTrade Bot</title>
+  <title>Trade Executor</title>
   <link rel="stylesheet" href="sidepanel.css">
 </head>
 
@@ -13,120 +13,64 @@
     <!-- Header -->
     <header class="header">
       <div class="logo">
-        <span class="logo-icon">📈</span>
-        <span class="logo-text">DeTrade Bot</span>
-      </div>
-      <div class="connection-status" id="connectionStatus">
-        <span class="status-dot disconnected"></span>
-        <span class="status-text">Disconnected</span>
+        <span class="logo-text">⚡ DeTrade Executor</span>
       </div>
     </header>
 
-    <!-- Price Display -->
-    <div class="price-section">
-      <div class="symbol-info">
-        <span class="symbol-name" id="symbolName">STONKS/USDT</span>
-        <span class="timeframe-badge" id="currentTimeframe">15s</span>
+    <!-- Server Config -->
+    <div class="card">
+      <div class="card-header">
+        <span>⚙️ Server Config</span>
       </div>
-      <div class="price-display">
-        <span class="current-price" id="currentPrice">---.--</span>
-        <span class="price-change positive" id="priceChange">+0.00%</span>
-      </div>
-    </div>
-
-    <!-- Chart Container -->
-    <div class="chart-section">
-      <div class="chart-header">
-        <div class="timeframe-buttons">
-          <button class="tf-btn" data-tf="5s">5s</button>
-          <button class="tf-btn active" data-tf="15s">15s</button>
-          <button class="tf-btn" data-tf="30s">30s</button>
-          <button class="tf-btn" data-tf="1m">1m</button>
-          <button class="tf-btn" data-tf="5m">5m</button>
-        </div>
-      </div>
-      <div class="chart-container" id="chartContainer"></div>
-    </div>
-
-    <!-- Strategy Info -->
-    <div class="strategy-section">
-      <div class="strategy-header">
-        <span class="strategy-title">📊 EMA Strategy</span>
-        <span class="ema-value" id="emaValue">EMA(50): ---.--</span>
-      </div>
-      <div class="signal-display">
-        <span class="signal-label">Signal:</span>
-        <span class="signal-value" id="currentSignal">WAITING</span>
+      <div class="config-row">
+        <label class="label">EVENT STREAM URL</label>
+        <input type="text" class="server-input" id="serverUrl" value="http://localhost:3000/events"
+          placeholder="http://localhost:3000/events" spellcheck="false">
       </div>
     </div>
 
-    <!-- Position Info -->
-    <div class="position-section" id="positionSection">
-      <div class="position-header">
-        <span class="position-title">📍 Current Position</span>
-      </div>
-      <div class="position-details" id="positionDetails">
-        <div class="position-row">
-          <span class="pos-label">Type:</span>
-          <span class="pos-value" id="positionType">NONE</span>
-        </div>
-        <div class="position-row">
-          <span class="pos-label">Entry:</span>
-          <span class="pos-value" id="entryPrice">---.--</span>
-        </div>
-        <div class="position-row">
-          <span class="pos-label">P&L:</span>
-          <span class="pos-value pnl" id="currentPnl">$0.00</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Trading Buttons -->
-    <div class="trading-section">
-      <div class="trading-buttons">
-        <button class="trade-btn buy-btn" id="buyBtn">
-          <span class="btn-icon">▲</span>
-          <span class="btn-text">BUY</span>
+    <!-- Control Buttons -->
+    <div class="controls-section">
+      <div class="main-buttons">
+        <button class="ctrl-btn start-btn" id="startBtn">
+          <span class="btn-icon">▶</span>
+          <span>START</span>
         </button>
-        <button class="trade-btn sell-btn" id="sellBtn">
-          <span class="btn-icon">▼</span>
-          <span class="btn-text">SELL</span>
+        <button class="ctrl-btn stop-btn" id="stopBtn" disabled>
+          <span class="btn-icon">■</span>
+          <span>STOP</span>
         </button>
       </div>
-      <button class="close-btn" id="closeBtn">
-        <span class="btn-icon">✕</span>
-        <span class="btn-text">CLOSE</span>
-      </button>
-    </div>
 
-    <!-- Bot Agent Section -->
-    <div class="bot-section">
-      <div class="bot-header">
-        <span class="bot-title">🤖 Bot Agent</span>
+      <!-- Reverse Toggle -->
+      <div class="reverse-section">
+        <div class="reverse-info">
+          <span class="reverse-icon">🔄</span>
+          <div>
+            <span class="reverse-title">Reverse Mode</span>
+            <span class="reverse-desc">UP→DOWN, DOWN→UP</span>
+          </div>
+        </div>
         <label class="toggle-switch">
-          <input type="checkbox" id="botToggle">
+          <input type="checkbox" id="reverseToggle">
           <span class="toggle-slider"></span>
         </label>
       </div>
-      <div class="bot-status">
-        <span class="bot-status-text" id="botStatus">Bot is OFF</span>
-        <span class="capital-display" style="float: right; font-size: 12px; color: #aaa;">
-          Capital: <span id="currentCapital" style="color: #fff; font-weight: bold;">---</span>
-        </span>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-section">
+      <div class="stat-item">
+        <span class="stat-value" id="connectedClients">0</span>
+        <span class="stat-label">Clients</span>
       </div>
-      <div class="bot-stats">
-        <div class="stat-item">
-          <span class="stat-label">Trades</span>
-          <span class="stat-value" id="totalTrades">0</span>
-        </div>
-        <div class="stat-item">
-          <span class="stat-label">Win Rate</span>
-          <span class="stat-value" id="winRate">0%</span>
-        </div>
-        <div class="stat-item">
-          <span class="stat-label">Total P&L</span>
-          <span class="stat-value" id="totalPnl">$0.00</span>
-        </div>
+      <div class="stat-item">
+        <span class="stat-value" id="tradesExecuted">0</span>
+        <span class="stat-label">Trades</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value" id="lastDirection">--</span>
+        <span class="stat-label">Last Trade</span>
       </div>
     </div>
 
@@ -137,13 +81,11 @@
         <button class="clear-log-btn" id="clearLogBtn">Clear</button>
       </div>
       <div class="log-container" id="logContainer">
-        <div class="log-entry info">Waiting for connection...</div>
+        <div class="log-entry info">Waiting to start...</div>
       </div>
     </div>
   </div>
 
-  <script src="../lib/lightweight-charts.standalone.production.min.js"></script>
-  <script src="strategy.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 
